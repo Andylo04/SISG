@@ -1,105 +1,77 @@
-
 import os
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 
-from extract.extraer_dw import extraer_atenciones_dw
 from extract.extraer_catalogos import extraer_catalogos
-from transform.transformar_datos import transformar_dataframe
-from transform.enriquecer_datos import enriquecer_atenciones
+from extract.extraer_sisg import extraer_hechos_locales, extraer_hospitales_local
+from load.datamart import cargar_datamart
 from load.insertar_atenciones import insertar_atenciones
+from transform.enriquecer_datos import enriquecer_atenciones
+from transform.mapear_claves import aplicar_mapeos
+from transform.transformar_datos import transformar_dataframe
 
 load_dotenv()
-
 REPORTS = Path("reports")
 REPORTS.mkdir(exist_ok=True)
 
 
+def guardar(df, nombre):
+    if df is not None and not df.empty:
+        df.to_csv(REPORTS / nombre, index=False, encoding="utf-8-sig")
+
+
 def main():
-    total_insertados = 0
-
     print("=" * 58)
-    print("SISG ETL - GRUPO 1 | EXTRACT - TRANSFORM - LOAD")
+    print("SISG ETL - GRUPO 1 | SISG local -> Data Mart -> DW")
     print("=" * 58)
 
-    # 1. EXTRACT
-    print("\n[1/4] EXTRACT: leyendo vista de atenciones del DW...")
-
-    hechos = extraer_atenciones_dw()
-
-    print(f"Registros extraídos: {len(hechos)}")
-
+    print("\n[1/5] EXTRACT: base operacional SISG (local)...")
+    hospitales = extraer_hospitales_local()
+    hechos = extraer_hechos_locales(os.getenv("ETL_ESTADO_CONSULTA", "ATENDIDA").strip() or None)
+    guardar(hechos, "1_hechos_origen.csv")
     if hechos.empty:
-        print("La vista no devolvió registros.")
+        print("SISG local no tiene consultas ni hospitalizaciones. Nada que procesar.")
         return
 
-    hechos.to_csv(
-        REPORTS / "atenciones_originales.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    # 2. EXTRACT CATALOGOS
-    print("\n[2/4] EXTRACT: leyendo catálogos...")
-
+    print("\n[2/5] EXTRACT: catálogos del DW (vw_cat_*)...")
     catalogos = extraer_catalogos()
 
-    # 3. TRANSFORM
-    print("\n[3/4] TRANSFORM: limpiando y enriqueciendo...")
-
-    validos, rechazados = transformar_dataframe(hechos)
-
+    print("\n[3/5] TRANSFORM: mapeo a llaves sk_* y validación...")
+    mapeados, revision = aplicar_mapeos(hechos, hospitales, catalogos)
+    guardar(revision, "2_revision_establecimientos.csv")
+    sin_match = revision[revision["sk_establecimiento"] == -1]
+    if not sin_match.empty:
+        print(f"AVISO: {len(sin_match)} hospital(es) sin equivalente en el DW (irán como -1). "
+              f"Revisa reports/2_revision_establecimientos.csv y completa config/mapeo_establecimiento.csv")
+    validos, rechazados = transformar_dataframe(mapeados, catalogos)
+    guardar(rechazados, "3_rechazados.csv")
     enriquecidos = enriquecer_atenciones(validos, catalogos)
-
-    enriquecidos.to_csv(
-        REPORTS / "atenciones_enriquecidas.csv",
-        index=False,
-        encoding="utf-8-sig"
-    )
-
+    guardar(enriquecidos, "3_atenciones_enriquecidas.csv")
+    print(f"Válidos: {len(validos)} | Rechazados: {len(rechazados)}")
     if not rechazados.empty:
-        rechazados.to_csv(
-            REPORTS / "rechazados.csv",
-            index=False,
-            encoding="utf-8-sig"
-        )
+        print(rechazados["motivo_rechazo"].value_counts().to_string())
 
-    print(f"Registros válidos: {len(validos)}")
-    print(f"Registros rechazados: {len(rechazados)}")
-    print(f"Registros enriquecidos: {len(enriquecidos)}")
+    print("\n[4/5] LOAD: Data Mart local...")
+    resumen = {"extraidos": len(mapeados), "validos": len(validos), "rechazados": len(rechazados)}
+    cargar_datamart(enriquecidos, catalogos, resumen)
 
-    # 4. LOAD
-    print("\n[4/4] LOAD: etapa de carga")
+    print("\n[5/5] LOAD: buzón del DW (ingesta_g1_atencion)...")
+    activar = os.getenv("ETL_ENABLE_LOAD", "false").strip().lower() == "true"
+    insertados, fallidos, existentes = insertar_atenciones(validos, simular=not activar)
+    guardar(fallidos, "4_fallidos_carga.csv")
+    if not activar:
+        print("(Modo simulación. Pon ETL_ENABLE_LOAD=true en .env para insertar de verdad.)")
 
-    activar_carga = os.getenv(
-        "ETL_ENABLE_LOAD", "false"
-    ).strip().lower() == "true"
-
-    if activar_carga:
-        print("Carga habilitada. Preparando INSERT...")
-
-        total_insertados = insertar_atenciones(enriquecidos)
-
-        print("Carga finalizada.")
-    else:
-        print("Carga deshabilitada.")
-        print("Los datos fueron preparados y guardados en CSV.")
-        print("Para habilitar INSERT, configura ETL_ENABLE_LOAD=true.")
-
-    # RESUMEN
     print("\n" + "=" * 58)
-    print("RESUMEN DEL ETL")
-    print("=" * 58)
-
-    print(f"Total extraído:       {len(hechos)}")
-    print(f"Total válido:         {len(validos)}")
-    print(f"Total rechazado:      {len(rechazados)}")
-    print(f"Total enriquecido:    {len(enriquecidos)}")
-    print(f"Total insertado en BD: {total_insertados}")
-
-    print(f"\nReportes: {REPORTS.resolve()}")
-    print("\nProceso ETL finalizado.")
+    print(f"Filas agregadas desde SISG : {len(mapeados)}")
+    print(f"Válidas                    : {len(validos)}")
+    print(f"Rechazadas (transform)     : {len(rechazados)}")
+    print(f"Ya existían en el DW       : {len(existentes)}")
+    print(f"Insertadas en el buzón     : {insertados}")
+    print(f"Fallidas en el buzón       : {len(fallidos)}")
+    print(f"Reportes en: {REPORTS.resolve()}")
 
 
 if __name__ == "__main__":

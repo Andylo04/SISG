@@ -96,3 +96,9 @@ def source_engine():
         pool_pre_ping=True,
         pool_recycle=1800,
     )
+
+
+def datamart_engine():
+    """Data Mart local del Grupo 1 (SQLite por defecto)."""
+    url = os.getenv("DATAMART_URL", "sqlite:///datamart_g1.db").strip()
+    return create_engine(url)

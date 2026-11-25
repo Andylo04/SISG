@@ -1,32 +1,13 @@
 def enriquecer_atenciones(hechos, catalogos):
-    """
-    Une la vista de hechos con catálogos usando SK.
-    Si no encuentra columnas compatibles, conserva los datos sin inventar campos.
-    """
+    """Une los hechos con los catálogos (solo para reportes/Data Mart)."""
     resultado = hechos.copy()
-    relaciones = [
-        ("sk_establecimiento", "establecimiento"),
-        ("sk_geografia", "geografia"),
-        ("sk_diagnostico", "diagnostico"),
-        ("sk_actor", "actor"),
-    ]
-
-    for clave, nombre in relaciones:
-        catalogo = catalogos.get(nombre)
-        if catalogo is None or catalogo.empty:
+    for clave, nombre in [("sk_establecimiento", "establecimiento"), ("sk_geografia", "geografia"),
+                          ("sk_diagnostico", "diagnostico"), ("sk_tiempo", "tiempo")]:
+        cat = catalogos.get(nombre)
+        if cat is None or cat.empty or clave not in resultado.columns or clave not in cat.columns:
             continue
-        if clave not in resultado.columns or clave not in catalogo.columns:
-            print(f"Aviso: no se encontró la clave {clave} en {nombre}; se omite el cruce.")
-            continue
-
-        catalogo_limpio = catalogo.drop_duplicates(subset=[clave])
-        columnas_nuevas = [c for c in catalogo_limpio.columns if c != clave and c not in resultado.columns]
-        if not columnas_nuevas:
-            continue
-        resultado = resultado.merge(
-            catalogo_limpio[[clave] + columnas_nuevas],
-            on=clave,
-            how="left",
-            validate="many_to_one",
-        )
+        cat = cat.drop_duplicates(subset=[clave])
+        nuevas = [c for c in cat.columns if c != clave and c not in resultado.columns]
+        if nuevas:
+            resultado = resultado.merge(cat[[clave] + nuevas], on=clave, how="left")
     return resultado

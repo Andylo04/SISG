@@ -7,6 +7,7 @@ from config.database import target_engine
 load_dotenv()
 
 CATALOGOS = {
+    "tiempo": "DW_CAT_TIEMPO_VIEW",
     "establecimiento": "DW_CAT_ESTABLECIMIENTO_VIEW",
     "geografia": "DW_CAT_GEOGRAFIA_VIEW",
     "diagnostico": "DW_CAT_DIAGNOSTICO_VIEW",

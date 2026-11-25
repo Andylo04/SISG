@@ -1,4 +1,14 @@
+"""
+LOAD hacia el buzón ingesta_g1_atencion.
 
+Reglas (según la guía de ingesta):
+  * Solo se hace INSERT en el buzón; el trigger del servidor lo refleja en el DW.
+  * El usuario del grupo NO necesariamente puede hacer SELECT sobre el buzón,
+    así que NO se consulta ese buzón: los duplicados se detectan contra la vista
+    de hechos (vw_g1_fact_atencion_privada).
+  * Cada fila va en su propia transacción: si el trigger rechaza una, las demás
+    siguen y el motivo queda en el reporte.
+"""
 import os
 import re
 
@@ -6,245 +16,67 @@ import pandas as pd
 from sqlalchemy import text
 
 from config.database import target_engine
+from extract.extraer_dw import CLAVE_HECHO, extraer_atenciones_dw
+
+COLUMNAS = ["sk_tiempo", "sk_establecimiento", "sk_geografia", "sk_diagnostico",
+            "atenciones", "dias_estancia", "monto_cobrado"]
+_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-COLUMNAS_ESPERADAS = [
-    "sk_tiempo",
-    "sk_establecimiento",
-    "sk_geografia",
-    "sk_diagnostico",
-    "atenciones",
-    "dias_estancia",
-    "monto_cobrado",
-]
-
-CATALOGOS = {
-    "sk_tiempo": (
-        "DW_CAT_TIEMPO_VIEW",
-        "sk_tiempo",
-    ),
-    "sk_establecimiento": (
-        "DW_CAT_ESTABLECIMIENTO_VIEW",
-        "sk_establecimiento",
-    ),
-    "sk_geografia": (
-        "DW_CAT_GEOGRAFIA_VIEW",
-        "sk_geografia",
-    ),
-    "sk_diagnostico": (
-        "DW_CAT_DIAGNOSTICO_VIEW",
-        "sk_diagnostico",
-    ),
-}
+def _tabla_destino():
+    tabla = os.getenv("DW_FACT_TABLE", "ingesta_g1_atencion").strip()
+    if not _ID.fullmatch(tabla):
+        raise ValueError("DW_FACT_TABLE no válido.")
+    return tabla
 
 
-def obtener_configuracion():
-    tabla = os.getenv("DW_FACT_TABLE", "").strip()
-    columnas_texto = os.getenv(
-        "DW_FACT_INSERT_COLUMNS", ""
-    ).strip()
-
-    if not tabla or not columnas_texto:
-        raise RuntimeError(
-            "Configura DW_FACT_TABLE y "
-            "DW_FACT_INSERT_COLUMNS en .env"
-        )
-
-    # Evitar nombres SQL arbitrarios en identificadores.
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tabla):
-        raise ValueError("Nombre de tabla no válido.")
-
-    columnas = [
-        columna.strip()
-        for columna in columnas_texto.split(",")
-        if columna.strip()
-    ]
-
-    if columnas != COLUMNAS_ESPERADAS:
-        raise ValueError(
-            "Las columnas configuradas en .env no coinciden "
-            f"con las esperadas: {COLUMNAS_ESPERADAS}"
-        )
-
-    return tabla, columnas
+def separar_ya_existentes(df):
+    """(nuevos, existentes) comparando la llave de 4 columnas contra la vista del DW."""
+    dw = extraer_atenciones_dw()
+    if dw.empty:
+        return df.copy(), df.iloc[0:0].copy()
+    llaves_dw = set(map(tuple, dw[CLAVE_HECHO].astype(int).itertuples(index=False, name=None)))
+    mask = [tuple(int(v) for v in fila) in llaves_dw
+            for fila in df[CLAVE_HECHO].itertuples(index=False, name=None)]
+    mask = pd.Series(mask, index=df.index)
+    return df.loc[~mask].copy(), df.loc[mask].copy()
 
 
-def validar_catalogos(conexion, datos):
-    """Comprueba que las claves existan en los catálogos del DW."""
-
-    for columna, (variable, clave_catalogo) in CATALOGOS.items():
-        vista = os.getenv(variable, "").strip()
-
-        if not vista:
-            raise RuntimeError(
-                f"Falta configurar {variable} en .env"
-            )
-
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", vista):
-            raise ValueError(
-                f"Nombre de vista no válido: {vista}"
-            )
-
-        claves = datos[columna].drop_duplicates().tolist()
-
-        consulta = text(
-            f"SELECT `{clave_catalogo}` "
-            f"FROM `{vista}` "
-            f"WHERE `{clave_catalogo}` IN :claves"
-        ).bindparams(
-            __import__("sqlalchemy").bindparam(
-                "claves", expanding=True
-            )
-        )
-
-        existentes = {
-            fila[0]
-            for fila in conexion.execute(
-                consulta,
-                {"claves": claves},
-            ).fetchall()
-        }
-
-        faltantes = set(claves) - existentes
-
-        if faltantes:
-            raise ValueError(
-                f"Claves inexistentes en {vista}, "
-                f"columna {clave_catalogo}: {sorted(faltantes)}"
-            )
-
-        print(
-            f"Catálogo {vista}: "
-            f"{len(claves)} claves verificadas."
-        )
-
-
-def insertar_atenciones(df):
+def insertar_atenciones(df, simular=False):
+    """Devuelve (insertados, fallidos_df, existentes_df)."""
+    vacio = pd.DataFrame()
     if df.empty:
         print("No hay registros para insertar.")
-        return 0
+        return 0, vacio, vacio
 
-    tabla, columnas = obtener_configuracion()
+    tabla = _tabla_destino()
+    datos = df[COLUMNAS].copy()
+    nuevos, existentes = separar_ya_existentes(datos)
+    print(f"Ya existen en el DW (se omiten): {len(existentes)} | Nuevos a insertar: {len(nuevos)}")
 
-    faltantes = [
-        columna for columna in columnas
-        if columna not in df.columns
-    ]
+    if simular:
+        print("SIMULACIÓN: no se inserta nada. Primeras filas que se insertarían:")
+        print(nuevos.head(10).to_string(index=False))
+        return 0, vacio, existentes
 
-    if faltantes:
-        raise ValueError(
-            f"Faltan columnas en el DataFrame: {faltantes}"
-        )
-
-    datos = df[columnas].copy()
-
-    if datos.isnull().any().any():
-        raise ValueError(
-            "Hay valores nulos en las columnas obligatorias."
-        )
-
-    columnas_enteras = [
-        "sk_tiempo",
-        "sk_establecimiento",
-        "sk_geografia",
-        "sk_diagnostico",
-        "atenciones",
-        "dias_estancia",
-    ]
-
-    for columna in columnas_enteras:
-        valores = pd.to_numeric(
-            datos[columna], errors="raise"
-        )
-
-        if (valores % 1 != 0).any():
-            raise ValueError(
-                f"La columna {columna} contiene valores no enteros."
-            )
-
-        datos[columna] = valores.astype("int64")
-
-    datos["monto_cobrado"] = pd.to_numeric(
-        datos["monto_cobrado"],
-        errors="raise",
+    sql = text(
+        f"INSERT INTO `{tabla}` ({', '.join(f'`{c}`' for c in COLUMNAS)}) "
+        f"VALUES ({', '.join(f':{c}' for c in COLUMNAS)})"
     )
-
-    if (datos["atenciones"] < 0).any():
-        raise ValueError("Las atenciones no pueden ser negativas.")
-
-    if (datos["dias_estancia"] < 0).any():
-        raise ValueError("Los días de estancia no pueden ser negativos.")
-
-    if (datos["monto_cobrado"] < 0).any():
-        raise ValueError("El monto cobrado no puede ser negativo.")
-
-    # Evitar filas repetidas dentro del mismo archivo.
-    datos = datos.drop_duplicates(
-        subset=columnas
-    ).copy()
-
+    insertados, fallidos = 0, []
     engine = target_engine()
-
-    insertados = 0
-    duplicados = 0
-
-    columnas_sql = ", ".join(
-        f"`{columna}`" for columna in columnas
-    )
-
-    parametros_sql = ", ".join(
-        f":{columna}" for columna in columnas
-    )
-
-    consulta_duplicado = text(f"""
-        SELECT COUNT(*)
-        FROM `{tabla}`
-        WHERE
-            sk_tiempo = :sk_tiempo
-            AND sk_establecimiento = :sk_establecimiento
-            AND sk_geografia = :sk_geografia
-            AND sk_diagnostico = :sk_diagnostico
-            AND atenciones = :atenciones
-            AND dias_estancia = :dias_estancia
-            AND monto_cobrado = :monto_cobrado
-    """)
-
-    consulta_insert = text(f"""
-        INSERT INTO `{tabla}` ({columnas_sql})
-        VALUES ({parametros_sql})
-    """)
-
     try:
-        with engine.begin() as conexion:
-
-            print("\nValidando claves de catálogos...")
-            validar_catalogos(conexion, datos)
-
-            print("\nIniciando carga...")
-
-            for registro in datos.to_dict(orient="records"):
-
-                existe = conexion.execute(
-                    consulta_duplicado,
-                    registro,
-                ).scalar_one()
-
-                if existe:
-                    duplicados += 1
-                    continue
-
-                conexion.execute(
-                    consulta_insert,
-                    registro,
-                )
-
+        for fila in nuevos.to_dict(orient="records"):
+            fila = {k: (float(v) if k == "monto_cobrado" else int(v)) for k, v in fila.items()}
+            try:
+                with engine.begin() as conn:
+                    conn.execute(sql, fila)
                 insertados += 1
-
-        print("\nCarga finalizada correctamente.")
-        print(f"Insertados: {insertados}")
-        print(f"Duplicados omitidos: {duplicados}")
-
-        return insertados
-
+            except Exception as e:  # trigger / permisos / FK
+                fallidos.append({**fila, "error": str(getattr(e, "orig", e))[:300]})
     finally:
         engine.dispose()
+
+    fallidos_df = pd.DataFrame(fallidos)
+    print(f"Insertados: {insertados} | Fallidos: {len(fallidos_df)}")
+    return insertados, fallidos_df, existentes
