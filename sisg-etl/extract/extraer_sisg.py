@@ -1,4 +1,3 @@
-
 import re
 
 import pandas as pd
@@ -152,3 +151,81 @@ def extraer_hechos_locales(
     )
 
     return pd.concat([cons, hosp], ignore_index=True)
+
+
+def extraer_registros_locales(
+    estado_consulta="ATENDIDA",
+    solo_egresadas=True,
+    hospital_id=HOSPITAL_ID
+):
+    """
+    Un registro por hospitalización / consulta (sin agrupar), con su id de origen.
+
+    Devuelve: tipo, origen_id, sk_tiempo, hospital_id, cie10,
+              atenciones, dias_estancia, monto_cobrado
+    """
+    filtro_egreso = "AND x.fecha_egreso IS NOT NULL" if solo_egresadas else ""
+
+    sql_h = f"""
+        SELECT
+            'HOSP' AS tipo,
+            x.hospitalizacion_id AS origen_id,
+            (YEAR(x.fecha_ingreso) * 10000
+             + MONTH(x.fecha_ingreso) * 100 + 1) AS sk_tiempo,
+            x.hospital_id,
+            x.cie10_ingreso AS cie10,
+            1 AS atenciones,
+            GREATEST(
+                DATEDIFF(
+                    COALESCE(x.fecha_egreso, x.fecha_ingreso),
+                    x.fecha_ingreso
+                ), 0
+            ) AS dias_estancia,
+            COALESCE(x.monto_facturado, 0) AS monto_cobrado
+        FROM hospitalizacion x
+        WHERE x.hospital_id = :hospital_id
+          {filtro_egreso}
+    """
+
+    sql_c = """
+        SELECT
+            'CONS' AS tipo,
+            c.consulta_id AS origen_id,
+            (YEAR(c.fecha_hora) * 10000
+             + MONTH(c.fecha_hora) * 100 + 1) AS sk_tiempo,
+            c.hospital_id,
+            (SELECT MIN(cd.cie10_codigo)
+               FROM consulta_diagnostico cd
+              WHERE cd.consulta_id = c.consulta_id
+                AND cd.es_principal = 1) AS cie10,
+            1 AS atenciones,
+            0 AS dias_estancia,
+            COALESCE(c.monto_facturado, 0) AS monto_cobrado
+        FROM consulta c
+        WHERE c.hospital_id = :hospital_id
+          AND c.estado = :estado
+    """
+
+    estado = estado_consulta or "ATENDIDA"
+    engine = source_engine()
+    try:
+        with engine.connect() as conn:
+            h = pd.read_sql(text(sql_h), conn, params={"hospital_id": hospital_id})
+            c = pd.read_sql(
+                text(sql_c), conn,
+                params={"hospital_id": hospital_id, "estado": estado}
+            )
+            abiertas = 0
+            if solo_egresadas:
+                abiertas = conn.execute(
+                    text("SELECT COUNT(*) FROM hospitalizacion "
+                         "WHERE hospital_id = :hospital_id AND fecha_egreso IS NULL"),
+                    {"hospital_id": hospital_id}
+                ).scalar()
+    finally:
+        engine.dispose()
+
+    if solo_egresadas and abiertas:
+        print(f"Hospitalizaciones sin egreso (no se envían todavía): {abiertas}")
+
+    return pd.concat([h, c], ignore_index=True)

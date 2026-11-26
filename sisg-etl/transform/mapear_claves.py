@@ -85,7 +85,7 @@ def mapa_establecimiento(hospitales, cat_est, umbral=0.80):
     return resultado, pd.DataFrame(filas)
 
 
-def aplicar_mapeos(hechos, hospitales, catalogos):
+def aplicar_mapeos(hechos, hospitales, catalogos, agrupar=True):
     """Devuelve hechos con sk_* y la tabla de revisión de establecimientos."""
     est_map, revision = mapa_establecimiento(hospitales, catalogos.get("establecimiento", pd.DataFrame()))
     geo_map = mapa_geografia(catalogos.get("geografia", pd.DataFrame()))
@@ -102,6 +102,15 @@ def aplicar_mapeos(hechos, hospitales, catalogos):
     d["sk_tiempo"] = d["sk_tiempo"].astype(int)
 
     claves = ["sk_tiempo", "sk_establecimiento", "sk_geografia", "sk_diagnostico"]
+
+    if not agrupar:
+        extra = [c for c in ["tipo", "origen_id"] if c in d.columns]
+        d = d[extra + claves + ["atenciones", "dias_estancia", "monto_cobrado"]].copy()
+        d["atenciones"] = d["atenciones"].astype(int)
+        d["dias_estancia"] = d["dias_estancia"].astype(int)
+        d["monto_cobrado"] = d["monto_cobrado"].astype(float).round(2)
+        return d, revision
+
     d = (d.groupby(claves, as_index=False)
            .agg(atenciones=("atenciones", "sum"), dias_estancia=("dias_estancia", "sum"),
                 monto_cobrado=("monto_cobrado", "sum")))

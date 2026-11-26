@@ -3,9 +3,8 @@ LOAD hacia el buzón ingesta_g1_atencion.
 
 Reglas (según la guía de ingesta):
   * Solo se hace INSERT en el buzón; el trigger del servidor lo refleja en el DW.
-  * El usuario del grupo NO necesariamente puede hacer SELECT sobre el buzón,
-    así que NO se consulta ese buzón: los duplicados se detectan contra la vista
-    de hechos (vw_g1_fact_atencion_privada).
+  * Los duplicados se detectan contra la vista de hechos Y contra el propio buzón
+    (el DW procesa el buzón de forma diferida, así que la vista aún no lo refleja).
   * Cada fila va en su propia transacción: si el trigger rechaza una, las demás
     siguen y el motivo queda en el reporte.
 """
@@ -30,15 +29,32 @@ def _tabla_destino():
     return tabla
 
 
+def _llaves_buzon():
+    """Llaves ya enviadas al buzón (incluye las aún no procesadas por el DW)."""
+    tabla = _tabla_destino()
+    engine = target_engine()
+    try:
+        with engine.connect() as conn:
+            b = pd.read_sql(text(f"SELECT {', '.join(CLAVE_HECHO)} FROM `{tabla}`"), conn)
+    finally:
+        engine.dispose()
+    return set(map(tuple, b.astype(int).itertuples(index=False, name=None))) if not b.empty else set()
+
+
 def separar_ya_existentes(df):
-    """(nuevos, existentes) comparando la llave de 4 columnas contra la vista del DW."""
+    """
+    (nuevos, existentes). Una fila ya existe si su llave de 4 columnas está en la
+    vista de hechos O en el buzón. El buzón es imprescindible: el DW procesa sus
+    filas de forma diferida (procesado_etl), y mientras tanto la vista no las muestra.
+    """
+    llaves = _llaves_buzon()
     dw = extraer_atenciones_dw()
-    if dw.empty:
+    if not dw.empty:
+        llaves |= set(map(tuple, dw[CLAVE_HECHO].astype(int).itertuples(index=False, name=None)))
+    if not llaves:
         return df.copy(), df.iloc[0:0].copy()
-    llaves_dw = set(map(tuple, dw[CLAVE_HECHO].astype(int).itertuples(index=False, name=None)))
-    mask = [tuple(int(v) for v in fila) in llaves_dw
-            for fila in df[CLAVE_HECHO].itertuples(index=False, name=None)]
-    mask = pd.Series(mask, index=df.index)
+    mask = pd.Series([tuple(int(v) for v in fila) in llaves
+                      for fila in df[CLAVE_HECHO].itertuples(index=False, name=None)], index=df.index)
     return df.loc[~mask].copy(), df.loc[mask].copy()
 
 
